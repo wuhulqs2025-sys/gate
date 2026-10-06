@@ -99,6 +99,8 @@ def log(section, msg=""):
 def die(msg):
     log("FATAL", f"[失败] {msg}")
     sys.exit(1)
+
+
   def fetch_vpngate():
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
