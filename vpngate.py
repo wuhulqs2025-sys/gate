@@ -5,17 +5,14 @@ VPN Gate SSTP 节点检测流水线
 流程:
   1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV, 失败时回退 GitHub 预解析镜像)
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
-     (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
   4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
-     (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
   6. 网页端 (GitHub Pages) 读取 data.json 展示
 
 退出码:
-  0 = 正常完成 (允许部分节点检测失败)
+  0 = 正常完成
   1 = 硬性失败 (数据源全挂 / 解析不出 SSTP 节点 / Worker 完全不可达 / 程序异常)
-     这些情况绝不允许"假成功"
 """
 
 import base64
@@ -32,12 +29,16 @@ from urllib.parse import quote
 
 import requests
 
+# 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
@@ -84,6 +85,9 @@ COUNTRY_ZH = {
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
 }
 
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
 _section = None
 
 
@@ -101,7 +105,10 @@ def die(msg):
     sys.exit(1)
 
 
-  def fetch_vpngate():
+# ---------------------------------------------------------------------------
+# 第 1 步: 获取 VPN Gate 原始节点
+# ---------------------------------------------------------------------------
+def fetch_vpngate():
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
         resp = requests.get(
@@ -128,7 +135,7 @@ def die(msg):
             return rows, "github-mirror"
     except Exception as exc:
         log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
 
 
 def parse_csv(text):
@@ -203,6 +210,9 @@ def parse_mirror_json(data):
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 第 2 步: 筛选 SSTP 节点
+# ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
 
@@ -249,6 +259,9 @@ def dedupe(nodes):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 第 3 步: 并发调用 Worker
+# ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
     if is_datacenter is True:
         return "datacenter"
@@ -282,7 +295,6 @@ def check_one(node, session):
         print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 状态码: {r.status_code}")
         if r.status_code != 200:
             print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 错误响应: {r.text[:300]}")
-        if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
             return out
@@ -326,7 +338,12 @@ def check_all(nodes, session):
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
-  def build_outputs(results, raw_count, sstp_count, source):
+
+
+# ---------------------------------------------------------------------------
+# 第 4 步: 生成网页数据
+# ---------------------------------------------------------------------------
+def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
