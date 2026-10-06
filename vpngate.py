@@ -32,40 +32,32 @@ from urllib.parse import quote
 
 import requests
 
-# 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-# ---------------------------------------------------------------------------
-# 配置 (均可用环境变量覆盖, 便于本地测试)
-# ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
-# 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://li.shange666.ccwu.cc/check?sstp=vpn:vpn@")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
-MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
-# 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
     "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASWEB",
 ]
-# 常见住宅宽带运营商关键词
 RESIDENTIAL_ORG_KEYWORDS = [
     "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
     "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
@@ -74,7 +66,6 @@ RESIDENTIAL_ORG_KEYWORDS = [
     "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB", "FREE FRANCE", "BT OPEN",
 ]
 
-# ISO 国家码 -> 中文名 (edgetunnel 清单展示用; 未收录则回退英文原名)
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
     "RO": "罗马尼亚", "TH": "泰国", "VN": "越南", "DE": "德国", "FR": "法国",
@@ -93,9 +84,6 @@ COUNTRY_ZH = {
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
 }
 
-# ---------------------------------------------------------------------------
-# 日志 (用户要求的分区格式)
-# ---------------------------------------------------------------------------
 _section = None
 
 
@@ -109,18 +97,9 @@ def log(section, msg=""):
 
 
 def die(msg):
-    """硬性失败: 明确报错并退出非 0, 绝不允许假成功。"""
     log("FATAL", f"[失败] {msg}")
     sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# 第 1 步: 获取 VPN Gate 原始节点
-# ---------------------------------------------------------------------------
-def fetch_vpngate():
-    """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
+  def fetch_vpngate():
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
         resp = requests.get(
@@ -137,7 +116,6 @@ def fetch_vpngate():
     except Exception as exc:
         log("VPN GATE", f"官方 API 获取失败: {exc}")
 
-    # --- 回退源: GitHub 预解析镜像 ---
     try:
         log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
@@ -152,7 +130,6 @@ def fetch_vpngate():
 
 
 def parse_csv(text):
-    """解析官方 CSV。表头行含 'HostName'; 按列名映射, 列名缺失时用固定位置回退。"""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     header_idx = None
     for i, ln in enumerate(lines):
@@ -164,7 +141,6 @@ def parse_csv(text):
 
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
-    # 列名映射 (不假设固定位置, 列名变化时自动适配; 全缺失时回退到已知位置)
     idx = {}
     for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
         for i, h in enumerate(header):
@@ -202,7 +178,6 @@ def parse_csv(text):
 
 
 def parse_mirror_json(data):
-    """解析 GitHub 镜像 JSON: [ { "servers": [ {hostname, ip, countrylong, countryshort, openvpn_configdata_base64} ] } ]"""
     servers = []
     items = data if isinstance(data, list) else [data]
     for item in items:
@@ -226,16 +201,11 @@ def parse_mirror_json(data):
     return rows
 
 
-# ---------------------------------------------------------------------------
-# 第 2 步: 筛选 SSTP 节点 (只保留带 TCP 入口的中继)
-# ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
 
 
 def to_sstp_nodes(rows):
-    """把原始行转成 SSTP 节点: 解码 OpenVPN 配置, 仅保留 proto tcp + remote 端口。
-    host 统一为 <short>.opengw.net 形式; 返回去重前的节点列表。"""
     nodes = []
     for r in rows:
         cfg = ""
@@ -245,7 +215,7 @@ def to_sstp_nodes(rows):
             except Exception:
                 cfg = ""
         if not _PROTO_TCP_RE.search(cfg):
-            continue  # 无 TCP 入口 -> 不是 SSTP 可用节点, 丢弃
+            continue
         m = _REMOTE_RE.search(cfg)
         if not m:
             continue
@@ -266,7 +236,6 @@ def to_sstp_nodes(rows):
 
 
 def dedupe(nodes):
-    """按 host+port+protocol 去重。"""
     seen = set()
     out = []
     for n in nodes:
@@ -278,38 +247,26 @@ def dedupe(nodes):
     return out
 
 
-# ---------------------------------------------------------------------------
-# 第 3 步: 并发调用 Cloudflare Worker
-# ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
-    """住宅/机房分类, 按可信度排序:
-    1) Worker 返回的真实 is_datacenter 标志 (IP 情报库);
-    2) 出口 ASN 组织名关键词;
-    3) host 前缀启发式 (最后兜底, 属估算)。"""
-    # 1) 真实数据中心标志 (SSTP 版 Worker 顶层 exit 直接给出)
     if is_datacenter is True:
         return "datacenter"
     if is_datacenter is False:
         return "residential"
-    # 2) 出口组织名关键词
     org = (exit_org or "").upper()
     if org:
         if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
             return "datacenter"
         if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS):
             return "residential"
-    # 3) host 前缀启发式 (估算)
     h = host.lower()
     if h.startswith("public-vpn"):
-        return "datacenter"      # VPN Gate 官方公共中继 (机房/托管)
+        return "datacenter"
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h):
-        return "residential"     # 数字编号 = 注册的家用宽带中继 (家宽, 估算)
+        return "residential"
     return "unknown"
 
 
 def check_one(node, session):
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
-    单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
@@ -320,14 +277,9 @@ def check_one(node, session):
     out["residential"] = "unknown"
     try:
         r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-
-        # ================== 新增调试代码开始 ==================
-        # 打印 Worker 的状态码和错误响应, 方便定位问题
         print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 状态码: {r.status_code}")
         if r.status_code != 200:
             print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 错误响应: {r.text[:300]}")
-        # ================== 新增调试代码结束 ==================
-
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -339,7 +291,6 @@ def check_one(node, session):
         out["latency_ms"] = j.get("responseTime")
         out["colo"] = j.get("colo")
         out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
         exit_info = j.get("exit") or {}
         if exit_info:
             asn = exit_info.get("asn") or {}
@@ -362,26 +313,18 @@ def check_one(node, session):
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
-        # ================== 新增调试代码开始 ==================
         print(f"[DEBUG] {node['host']}:{node['port']} -> 请求异常: {type(exc).__name__} - {exc}")
-        # ================== 新增调试代码结束 ==================
         return out
 
 
 def check_all(nodes, session):
-    """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = [pool.submit(check_one, n, session) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
-
-
-# ---------------------------------------------------------------------------
-# 第 4 步: 生成网页数据
-# ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
+  def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
@@ -422,8 +365,6 @@ CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains
 
 
 def build_chains_text(data):
-    """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
-    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
     countries = data["countries"]
     lines = [
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
@@ -465,8 +406,6 @@ def build_chains_text(data):
     return "\n".join(lines) + "\n"
 
 
-# edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
-# 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
@@ -481,10 +420,7 @@ HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.
 
 
 def build_hosts_text(data):
-    """生成可直接粘贴进后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
     lines = [
@@ -532,7 +468,6 @@ def build_hosts_text(data):
     return "\n".join(lines) + "\n"
 
 
-# edgetunnel 完整订阅 (vless://) 配置
 EDT_UUID = os.environ.get("EDT_UUID", "537be14b-8d9c-489e-a3d0-cafac3a05fcf")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "qi.shange666.ccwu.cc")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
@@ -540,7 +475,6 @@ SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
-    """复刻 edgetunnel 的 base64SecretEncode: UTF-8 循环密钥 XOR + 标准 base64。"""
     data = plaintext.encode("utf-8")
     key = secret.encode("utf-8")
     mixed = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
@@ -548,7 +482,6 @@ def _b64_secret_encode(plaintext, secret):
 
 
 def _socks5_account(address, default_port=80):
-    """复刻 edgetunnel 的 获取SOCKS5账号: user:pass@host:port -> {username,password,hostname,port}。"""
     address = re.sub(r"^(socks5|http|https|turn|sstp)://", "", address.strip(), flags=re.I).split("#")[0].strip()
     at = address.rfind("@")
     auth, hostpart = (address[:at], address[at + 1:]) if at != -1 else ("", address)
@@ -572,8 +505,6 @@ def _socks5_account(address, default_port=80):
 
 
 def build_sub_text(data):
-    """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)。
-    填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。"""
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
@@ -621,8 +552,85 @@ def write_outputs(data):
     with open(data_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
-    # 固定网页: 始终用 web/index.html 模板生成同一个 index.html (数据来自 data.json)
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
-            html
+            html = f.read()
+    else:
+        html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
+                "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
+                "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
+    with open(chains_path, "w", encoding="utf-8") as f:
+        f.write(build_chains_text(data))
+
+    hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
+    with open(hosts_path, "w", encoding="utf-8") as f:
+        f.write(build_hosts_text(data))
+
+    sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
+    with open(sub_path, "w", encoding="utf-8") as f:
+        f.write(build_sub_text(data))
+    return data_path, html_path, chains_path, hosts_path, sub_path
+
+
+def main():
+    session = requests.Session()
+
+    rows, source = fetch_vpngate()
+    raw_count = len(rows)
+    if raw_count == 0:
+        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
+
+    sstp_nodes = to_sstp_nodes(rows)
+    sstp_count = len(sstp_nodes)
+    if sstp_count == 0:
+        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
+    uniq = dedupe(sstp_nodes)
+
+    if MAX_CHECK_NODES > 0:
+        uniq = uniq[:MAX_CHECK_NODES]
+
+    log("VPN GATE", f"获取原始节点: {raw_count}")
+    log("VPN GATE", f"SSTP 节点: {sstp_count}")
+    log("VPN GATE", f"去重后: {len(uniq)}")
+
+    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    t0 = time.time()
+    results = check_all(uniq, session)
+    elapsed = time.time() - t0
+
+    success = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+    worker_errors = [r for r in failed if r.get("worker_error")]
+
+    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
+    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
+    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+
+    if uniq and not success and len(worker_errors) == len(uniq):
+        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+
+    data = build_outputs(results, raw_count, sstp_count, source)
+    log("RESULT", f"可用节点: {len(success)}")
+    log("RESULT", f"国家数量: {data['stats']['countries']}")
+
+    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
+    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        die(f"程序异常: {type(exc).__name__}: {exc}")
