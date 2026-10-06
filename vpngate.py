@@ -320,6 +320,14 @@ def check_one(node, session):
     out["residential"] = "unknown"
     try:
         r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+
+        # ================== 新增调试代码开始 ==================
+        # 打印 Worker 的状态码和错误响应, 方便定位问题
+        print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 状态码: {r.status_code}")
+        if r.status_code != 200:
+            print(f"[DEBUG] {node['host']}:{node['port']} -> Worker 错误响应: {r.text[:300]}")
+        # ================== 新增调试代码结束 ==================
+
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -354,6 +362,9 @@ def check_one(node, session):
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
+        # ================== 新增调试代码开始 ==================
+        print(f"[DEBUG] {node['host']}:{node['port']} -> 请求异常: {type(exc).__name__} - {exc}")
+        # ================== 新增调试代码结束 ==================
         return out
 
 
@@ -614,93 +625,4 @@ def write_outputs(data):
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
-            html = f.read()
-    else:
-        html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
-                "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
-                "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    # edgetunnel 链式代理清单 (固定 URL, 方案一: 名字不变、指令自动换)
-    chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
-    with open(chains_path, "w", encoding="utf-8") as f:
-        f.write(build_chains_text(data))
-
-    # 可直接粘贴进后台「自定义优选IP」框的清单 (入口地址#名字$sstp://...)
-    hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
-    with open(hosts_path, "w", encoding="utf-8") as f:
-        f.write(build_hosts_text(data))
-
-    # 完整 vless:// 订阅 (填进后台「订阅链接」URL, 客户端自动轮换)
-    sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
-    with open(sub_path, "w", encoding="utf-8") as f:
-        f.write(build_sub_text(data))
-    return data_path, html_path, chains_path, hosts_path, sub_path
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def main():
-    session = requests.Session()
-
-    # 1) 数据源
-    rows, source = fetch_vpngate()
-    raw_count = len(rows)
-    if raw_count == 0:
-        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
-
-    # 2) SSTP 筛选 + 去重
-    sstp_nodes = to_sstp_nodes(rows)
-    sstp_count = len(sstp_nodes)
-    if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
-    uniq = dedupe(sstp_nodes)
-
-    if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
-
-    log("VPN GATE", f"获取原始节点: {raw_count}")
-    log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
-
-    # 3) 并发检测
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-    t0 = time.time()
-    results = check_all(uniq, session)
-    elapsed = time.time() - t0
-
-    success = [r for r in results if r.get("success")]
-    failed = [r for r in results if not r.get("success")]
-    worker_errors = [r for r in failed if r.get("worker_error")]
-
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
-
-    # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
-
-    # 4) 结果 + 网页
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
-    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        die(f"程序异常: {type(exc).__name__}: {exc}")
+            html
